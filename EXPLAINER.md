@@ -177,8 +177,8 @@ Everything is one file, `apple_to_ytmusic.py`, grouped by stage:
 cd /Users/adinath/Documents/Playground/GitHub/apple-to-ytmusic
 PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
 
-# one-time: log in to YouTube Music
-$PY -m ytmusicapi browser
+# one-time: log in to YouTube Music (use the ytmusicapi COMMAND, not python -m)
+/Library/Frameworks/Python.framework/Versions/3.13/bin/ytmusicapi browser --file browser.json
 
 # mirror a shared link, decide about download at the end
 $PY apple_to_ytmusic.py --url "https://music.apple.com/us/playlist/…/pl.xxxxx"
