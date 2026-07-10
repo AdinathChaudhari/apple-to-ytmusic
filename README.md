@@ -40,10 +40,12 @@ installed beside the 3.13 python — NOT `python -m ytmusicapi` (that has no `__
 
 1. Open `music.youtube.com` in a browser, logged in to the account the playlists should be
    created under.
-2. DevTools (Cmd+Option+I) → Network tab → reload → click any `browse` request to
+2. DevTools (Cmd+Option+I) → Network tab → reload → left-click any `browse` request to
    `music.youtube.com`.
-3. Right-click it → Copy → **Copy request headers**. Paste into the prompt, press Enter, then
-   Ctrl-D.
+3. In the detail panel → **Headers** tab → scroll to **Request Headers** → click the **`Raw`**
+   toggle. Select all that text (Cmd+A), copy, paste into the prompt, press Enter, then Ctrl-D.
+   (Use **Chrome/Firefox/Edge** — Safari's format doesn't parse. Use the **Raw** view, not the
+   expanded name/value view, which pulls in `:authority`/`:path` pseudo-headers and breaks parsing.)
 
 Run it from inside this folder (or keep `--file browser.json`) so the file lands next to the
 script, where the tool looks for it. The tool auto-detects a missing/invalid creds file and
