@@ -31,21 +31,31 @@ add only *new* songs and never delete anything.
 
 ## One-time YouTube Music auth
 
-Browser-header auth (no Google Cloud project needed):
+Browser-header auth (no Google Cloud project needed). Use the `ytmusicapi` **command**
+installed beside the 3.13 python — NOT `python -m ytmusicapi` (that has no `__main__` and errors):
 
 ```bash
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m ytmusicapi browser
+/Library/Frameworks/Python.framework/Versions/3.13/bin/ytmusicapi browser --file browser.json
 ```
 
 1. Open `music.youtube.com` in a browser, logged in to the account the playlists should be
    created under.
-2. DevTools → Network → filter for `/browse` → click any POST to `music.youtube.com`.
-3. Copy the request headers, paste into the prompt, finish with a blank line / Ctrl-D.
+2. DevTools (Cmd+Option+I) → Network tab → reload → click any `browse` request to
+   `music.youtube.com`.
+3. Right-click it → Copy → **Copy request headers**. Paste into the prompt, press Enter, then
+   Ctrl-D.
 
-This writes `browser.json` next to the script. The tool auto-detects a missing/invalid creds
-file and points you back here. Credentials expire periodically — just re-run this step.
+Run it from inside this folder (or keep `--file browser.json`) so the file lands next to the
+script, where the tool looks for it. The tool auto-detects a missing/invalid creds file and
+points you back here. Credentials expire periodically — just re-run this step.
 
-**Fallback:** `... -m ytmusicapi oauth` writes `oauth.json`; pass it with `--creds oauth.json`.
+**Fallback (oauth):** requires a Google "TV & Limited Input" OAuth client:
+
+```bash
+/Library/Frameworks/Python.framework/Versions/3.13/bin/ytmusicapi oauth --file oauth.json
+```
+
+Then pass it with `--creds oauth.json`.
 
 ## Automation permission (library mode only)
 
