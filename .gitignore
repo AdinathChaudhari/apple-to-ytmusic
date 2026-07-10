@@ -1,0 +1,9 @@
+browser.json
+oauth.json
+__pycache__/
+*.pyc
+*.csv
+match_report.csv
+runs.json
+downloads/
+.DS_Store
