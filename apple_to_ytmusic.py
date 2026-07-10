@@ -1,16 +1,28 @@
 #!/Library/Frameworks/Python.framework/Versions/3.13/bin/python3
 """
 apple_to_ytmusic.py — Mirror an Apple Music playlist to YouTube Music, then
-download it for an iPod.
+optionally download it for an iPod.
 
-Three stages, each independently reachable via CLI flags:
-  1. Read a playlist + its tracks from Apple Music (AppleScript / osascript).
+Sources (a playlist can come from either):
+  * A shared/public Apple Music playlist URL (music.apple.com/.../pl.xxxx) —
+    read straight from the public web page. The playlist does NOT need to be in
+    your library.
+  * A playlist in your own Apple Music library, read via AppleScript.
+
+Stages:
+  1. Read a playlist + its tracks (URL scrape or AppleScript).
   2. Search + score each track on YouTube Music (ytmusicapi), create/update a
      mirrored playlist, and write an audit report (match_report.csv).
-  3. Download the resulting YT Music playlist for offline listening via the
-     existing `streamlist` tool.
+  3. (optional) Download the resulting YT Music playlist for offline listening
+     via the existing `streamlist` tool.
 
-See README.md for one-time setup (ytmusicapi auth, Automation permission).
+Extras:
+  * --sync            Re-check every tracked playlist and ADD new songs only
+                      (never deletes). Non-interactive; no download.
+  * --install-weekly  Install a launchd job that runs --sync once a week.
+
+See README.md for one-time setup (ytmusicapi auth, Automation permission) and
+EXPLAINER.md for a ground-up walkthrough.
 """
 
 import argparse
@@ -22,6 +34,8 @@ import re
 import subprocess
 import sys
 import unicodedata
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -35,11 +49,17 @@ STREAMLIST = "/Users/adinath/Documents/Playground/GitHub/streamlist/streamlist.p
 DEFAULT_CREDS = "browser.json"                 # resolved relative to script dir
 RUNS_FILE = "runs.json"                         # relative to script dir
 REPORT_FILE = "match_report.csv"                # written into --out dir (see note)
+SYNC_LOG = "sync.log"                            # weekly sync log, in script dir
 DEFAULT_OUT = os.path.expanduser("~/Music/apple-to-ytmusic")
 CONFIDENCE_BAR = 60                             # score >= 60 => "confident"
 SEARCH_TOP_N = 5                                # scoring window over search results
 DELIM = "\x1f"                                  # AppleScript TSV delimiter (unit separator)
 YTM_URL = "https://music.youtube.com/playlist?list={pid}"
+
+# scheduling (launchd)
+PLIST_LABEL = "com.adinath.apple-to-ytmusic.sync"
+USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
 # scoring weights
 W_ARTIST = 40.0
@@ -52,6 +72,8 @@ VARIANT_KEYWORDS = [
     "sped up", "slowed", "reverb", "8d", "remaster",
     "demo", "edit", "version", "mix", "extended", "radio edit",
 ]
+
+APPLE_URL_RE = re.compile(r"https?://(?:[a-z0-9-]+\.)*music\.apple\.com/\S+", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -66,12 +88,16 @@ class AppleScriptError(Exception):
     """Raised for any other osascript failure."""
 
 
+class AppleURLError(Exception):
+    """Raised when a public Apple Music playlist URL cannot be read/parsed."""
+
+
 class CredsError(Exception):
     """Raised when ytmusicapi credentials are missing, invalid, or expired."""
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — Apple Music (AppleScript)
+# Stage 1a — Apple Music library (AppleScript)
 # ---------------------------------------------------------------------------
 
 def run_osascript(script: str) -> str:
@@ -84,7 +110,7 @@ def run_osascript(script: str) -> str:
     )
     if proc.returncode != 0:
         stderr = proc.stderr or ""
-        if "-1743" in stderr or "Not authorized" in stderr or "not authorized" in stderr:
+        if "-1743" in stderr or "not authorized" in stderr.lower():
             raise AppleMusicAuthError(stderr.strip())
         raise AppleScriptError(stderr.strip())
     return proc.stdout.rstrip("\n")
@@ -112,7 +138,7 @@ def escape_applescript_string(s: str) -> str:
 
 
 def dump_apple_tracks(playlist_name: str) -> list:
-    """Dump (title, artist, album, duration) for every track in the given playlist."""
+    """Dump (title, artist, album, duration) for every track in a library playlist."""
     escaped = escape_applescript_string(playlist_name)
     script = (
         'tell application "Music"\n'
@@ -143,6 +169,183 @@ def dump_apple_tracks(playlist_name: str) -> list:
             "duration": duration,
         })
     return tracks
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b — Apple Music public URL (scrape, no auth)
+# ---------------------------------------------------------------------------
+
+def is_apple_url(s: str) -> bool:
+    """True if the string looks like an Apple Music URL."""
+    return bool(s) and bool(APPLE_URL_RE.match(s.strip()))
+
+
+def fetch_url(url: str, timeout: int = 30) -> str:
+    """Fetch a URL with a browser User-Agent; return decoded HTML text.
+
+    Prefers `curl` (uses the macOS system trust store, avoiding the
+    Python.framework's missing-CA-roots SSL problem); falls back to urllib.
+    """
+    try:
+        proc = subprocess.run(
+            ["curl", "-sL", "--max-time", str(timeout), "-A", USER_AGENT,
+             "-H", "Accept-Language: en-US,en;q=0.9", url],
+            capture_output=True, timeout=timeout + 10,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout.decode("utf-8", errors="replace")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # curl unavailable or timed out — try urllib below
+
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                               "Accept-Language": "en-US,en;q=0.9"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        raise AppleURLError(f"Could not fetch {url}: {e}")
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_apple_playlist_html(html: str):
+    """Parse an Apple Music playlist page.
+
+    Returns (name, tracks, num_tracks_declared). Tracks are dicts of
+    {title, artist, album, duration(seconds)}. num_tracks_declared is the
+    playlist's own reported track count (for truncation detection) or None.
+    """
+    name = None
+    num_declared = None
+
+    # (a) JSON-LD gives a reliable name + numTracks.
+    m = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                  html, re.S)
+    if m:
+        try:
+            ld = json.loads(m.group(1))
+            name = ld.get("name") or name
+            num_declared = ld.get("numTracks")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # (b) serialized-server-data holds the full per-track detail (title/artist/duration).
+    tracks = []
+    m2 = re.search(r'<script[^>]*id="serialized-server-data"[^>]*>(.*?)</script>',
+                   html, re.S)
+    if m2:
+        try:
+            data = json.loads(m2.group(1))
+        except json.JSONDecodeError:
+            data = None
+        if data is not None:
+            songs = []
+            seen_ids = set()
+
+            def walk(o):
+                if isinstance(o, dict):
+                    cd = o.get("contentDescriptor")
+                    is_song = isinstance(cd, dict) and cd.get("kind") == "song"
+                    if is_song and o.get("title"):
+                        key = o.get("id") or (o.get("title"), o.get("artistName"),
+                                              o.get("trackNumber"))
+                        if key not in seen_ids:
+                            seen_ids.add(key)
+                            songs.append(o)
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        walk(v)
+
+            walk(data)
+
+            def track_number(o):
+                try:
+                    return int(o.get("trackNumber") or 0)
+                except (ValueError, TypeError):
+                    return 0
+
+            songs.sort(key=track_number)
+            for o in songs:
+                artist = o.get("artistName") or ""
+                if not artist:
+                    sl = o.get("subtitleLinks")
+                    if isinstance(sl, list) and sl:
+                        artist = sl[0].get("title", "")
+                dur_ms = o.get("duration")
+                try:
+                    duration = float(dur_ms) / 1000.0 if dur_ms else 0.0
+                except (ValueError, TypeError):
+                    duration = 0.0
+                tracks.append({
+                    "title": o.get("title", ""),
+                    "artist": artist,
+                    "album": "",
+                    "duration": duration,
+                })
+
+    if not name:
+        # last resort: slug from the URL path is handled by the caller
+        name = None
+    return name, tracks, num_declared
+
+
+def _name_from_apple_url(url: str) -> str:
+    """Derive a human-ish playlist name from the URL slug as a last resort."""
+    m = re.search(r"/playlist/([^/]+)/", url)
+    if m:
+        slug = m.group(1).replace("-", " ").strip()
+        return slug.title() if slug else "Apple Music Playlist"
+    return "Apple Music Playlist"
+
+
+def fetch_apple_url(url: str):
+    """Read a public Apple Music playlist URL. Returns (name, tracks).
+
+    Prints a warning (does not fail) if the page exposed fewer tracks than the
+    playlist declares — very large public playlists lazy-load beyond the initial
+    page. For full coverage of such playlists, add them to your library and run
+    by name instead.
+    """
+    if not is_apple_url(url):
+        raise AppleURLError(
+            f"Not an Apple Music URL: {url!r}. Expected a public/shared "
+            "playlist link like music.apple.com/.../pl.xxxx."
+        )
+    html = fetch_url(url)
+    name, tracks, num_declared = parse_apple_playlist_html(html)
+    if not name:
+        name = _name_from_apple_url(url)
+    if not tracks:
+        raise AppleURLError(
+            f"No tracks found on the page for {url}. Make sure the link is a "
+            "public/shared Apple Music playlist (music.apple.com/.../pl.xxxx)."
+        )
+    if num_declared and len(tracks) < num_declared:
+        print(
+            f"  ! Warning: page exposed {len(tracks)} of {num_declared} tracks. "
+            "This public playlist is larger than its page reveals. For full "
+            "coverage, add it to your Apple Music library and run it by name.",
+            file=sys.stderr,
+        )
+    return name, tracks
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — source dispatch
+# ---------------------------------------------------------------------------
+
+def get_tracks_from_source(source: dict):
+    """Given a source descriptor, return (name, tracks).
+
+    source = {"type": "url", "ref": <apple url>} or
+             {"type": "library", "ref": <playlist name>}
+    """
+    if source["type"] == "url":
+        return fetch_apple_url(source["ref"])
+    # library
+    name = source["ref"]
+    return name, dump_apple_tracks(name)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +474,6 @@ def choose_match(apple: dict, results: list) -> dict:
         s = score_candidate(apple, cand)
         scored.append((idx, cand, s))
 
-    # sort by (-score, -artist_sim, dur_diff, index) for stable tie-break
     def sort_key(item):
         idx, cand, s = item
         artist_sim = _artist_sim_only(apple, cand)
@@ -290,7 +492,6 @@ def choose_match(apple: dict, results: list) -> dict:
             "videoId": best_cand.get("videoId"),
         }
 
-    # fallback: raw top hit (results[0]), but report the top hit's own computed score
     top_hit = results[0]
     top_hit_score = score_candidate(apple, top_hit)
     return {
@@ -314,15 +515,16 @@ def search_track(yt, apple: dict) -> list:
     return results[:10]
 
 
-def match_playlist(yt, tracks: list) -> list:
-    """Search + score every track; print live progress."""
+def match_playlist(yt, tracks: list, quiet: bool = False) -> list:
+    """Search + score every track; print live progress unless quiet."""
     matches = []
     total = len(tracks)
     for i, track in enumerate(tracks, start=1):
         results = search_track(yt, track)
         match = choose_match(track, results)
-        chosen_title = match["candidate"]["title"] if match["candidate"] else "(no match)"
-        print(f'[{i}/{total}] {track["title"]} — {track["artist"]} -> {chosen_title} ({match["score"]})')
+        if not quiet:
+            chosen_title = match["candidate"]["title"] if match["candidate"] else "(no match)"
+            print(f'[{i}/{total}] {track["title"]} — {track["artist"]} -> {chosen_title} ({match["score"]})')
         matches.append(match)
     return matches
 
@@ -348,9 +550,17 @@ def save_runs(runs: dict) -> None:
         json.dump(runs, f, ensure_ascii=False, indent=2)
 
 
-def get_or_create_playlist(yt, name: str, runs: dict):
+def get_or_create_playlist(yt, name: str, runs: dict, source: dict):
+    """Reuse an existing mirrored playlist for `name`, or create a new one.
+
+    Records the source (url/library) so --sync knows where to re-read from.
+    """
     if name in runs:
         entry = runs[name]
+        # backfill source for pre-existing entries
+        if "source" not in entry:
+            entry["source"] = source
+            save_runs(runs)
         return entry["playlist_id"], set(entry.get("added_videoIds", []))
 
     pid = yt.create_playlist(name, "Mirrored from Apple Music")
@@ -362,6 +572,7 @@ def get_or_create_playlist(yt, name: str, runs: dict):
     runs[name] = {
         "playlist_id": pid,
         "added_videoIds": [],
+        "source": source,
         "last_run": datetime.now().isoformat(),
     }
     save_runs(runs)
@@ -369,6 +580,7 @@ def get_or_create_playlist(yt, name: str, runs: dict):
 
 
 def add_matches(yt, pid: str, matches: list, already: set, runs: dict, name: str) -> int:
+    """Add newly-matched videoIds to the playlist. Never removes anything."""
     new_ids = []
     seen = set(already)
     for m in matches:
@@ -384,7 +596,6 @@ def add_matches(yt, pid: str, matches: list, already: set, runs: dict, name: str
     try:
         yt.add_playlist_items(pid, new_ids, duplicates=False)
     except Exception:
-        # all-duplicate batches (or transient errors) — treat as no-op
         return 0
 
     entry = runs.setdefault(name, {"playlist_id": pid, "added_videoIds": []})
@@ -480,11 +691,139 @@ def make_ytmusic(creds_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Weekly sync
+# ---------------------------------------------------------------------------
+
+def run_sync(creds_path: str) -> int:
+    """Re-check every tracked playlist and ADD new songs only. Never deletes.
+
+    Non-interactive. Intended for the weekly launchd job. Logs a per-playlist
+    summary to stdout (which launchd routes to sync.log).
+    """
+    runs = load_runs()
+    if not runs:
+        print(f"[{datetime.now().isoformat()}] sync: nothing tracked yet.")
+        return 0
+
+    try:
+        yt = make_ytmusic(resolve_creds(creds_path))
+    except CredsError as e:
+        print(f"[{datetime.now().isoformat()}] sync: creds error: {e}")
+        return 2
+
+    total_added = 0
+    for name, entry in list(runs.items()):
+        source = entry.get("source") or {"type": "library", "ref": name}
+        stamp = datetime.now().isoformat()
+        try:
+            src_name, tracks = get_tracks_from_source(source)
+        except (AppleURLError, AppleMusicAuthError, AppleScriptError) as e:
+            print(f"[{stamp}] sync: '{name}' skipped — could not read source ({e}).")
+            continue
+        if not tracks:
+            print(f"[{stamp}] sync: '{name}' — source empty, skipped.")
+            continue
+
+        matches = match_playlist(yt, tracks, quiet=True)
+        pid = entry["playlist_id"]
+        already = set(entry.get("added_videoIds", []))
+        added = add_matches(yt, pid, matches, already, runs, name)
+        total_added += added
+        print(f"[{stamp}] sync: '{name}' — {len(tracks)} tracks, {added} new added.")
+
+    print(f"[{datetime.now().isoformat()}] sync: done. {total_added} new tracks across "
+          f"{len(runs)} playlist(s).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Scheduling (launchd)
+# ---------------------------------------------------------------------------
+
+def _plist_path() -> str:
+    return os.path.expanduser(f"~/Library/LaunchAgents/{PLIST_LABEL}.plist")
+
+
+def _plist_contents(creds_path: str) -> str:
+    script = os.path.join(SCRIPT_DIR, "apple_to_ytmusic.py")
+    log = os.path.join(SCRIPT_DIR, SYNC_LOG)
+    args = [PY313, script, "--sync"]
+    if creds_path and creds_path != DEFAULT_CREDS:
+        args += ["--creds", creds_path]
+    args_xml = "\n".join(f"    <string>{a}</string>" for a in args)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        f'  <key>Label</key><string>{PLIST_LABEL}</string>\n'
+        '  <key>ProgramArguments</key>\n'
+        '  <array>\n'
+        f'{args_xml}\n'
+        '  </array>\n'
+        '  <key>StartCalendarInterval</key>\n'
+        '  <dict>\n'
+        '    <key>Weekday</key><integer>0</integer>\n'
+        '    <key>Hour</key><integer>3</integer>\n'
+        '    <key>Minute</key><integer>0</integer>\n'
+        '  </dict>\n'
+        f'  <key>StandardOutPath</key><string>{log}</string>\n'
+        f'  <key>StandardErrorPath</key><string>{log}</string>\n'
+        '  <key>RunAtLoad</key><false/>\n'
+        '</dict>\n'
+        '</plist>\n'
+    )
+
+
+def install_weekly(creds_path: str) -> int:
+    """Write and load a launchd agent that runs --sync every Sunday at 03:00."""
+    path = _plist_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_plist_contents(creds_path))
+
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+    # bootout an old copy if present (ignore failure), then bootstrap the new one.
+    subprocess.run(["launchctl", "bootout", f"{domain}/{PLIST_LABEL}"],
+                   capture_output=True, text=True)
+    proc = subprocess.run(["launchctl", "bootstrap", domain, path],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"Wrote {path}\nbut `launchctl bootstrap` failed: {proc.stderr.strip()}")
+        return 2
+    print(
+        f"Installed weekly sync (launchd label {PLIST_LABEL}).\n"
+        f"  Runs: every Sunday at 03:00 -> {PY313} apple_to_ytmusic.py --sync\n"
+        f"  Plist: {path}\n"
+        f"  Log:   {os.path.join(SCRIPT_DIR, SYNC_LOG)}\n"
+        "Note: playlists sourced from your library need Apple Music running at run "
+        "time; URL-sourced playlists sync headlessly.\n"
+        "Run it now to test:  launchctl kickstart -k " + f"{domain}/{PLIST_LABEL}"
+    )
+    return 0
+
+
+def uninstall_weekly() -> int:
+    path = _plist_path()
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{PLIST_LABEL}"],
+                   capture_output=True, text=True)
+    if os.path.exists(path):
+        os.remove(path)
+        print(f"Removed weekly sync ({PLIST_LABEL}) and deleted {path}.")
+    else:
+        print(f"No weekly sync plist found at {path}. Nothing to remove.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI / interactive
 # ---------------------------------------------------------------------------
 
-def pick_playlist_interactive(names: list) -> str:
-    print("Apple Music playlists:")
+def pick_playlist_interactive(names: list):
+    print("Your Apple Music library playlists:")
     for i, n in enumerate(names, start=1):
         print(f"  {i}. {n}")
     while True:
@@ -501,6 +840,39 @@ def pick_playlist_interactive(names: list) -> str:
         print(f"Please enter a number between 1 and {len(names)}.")
 
 
+def choose_source_interactive() -> dict:
+    """Prompt for an Apple Music URL, or fall back to a library picker."""
+    raw = input(
+        "Paste an Apple Music playlist URL, or press Enter to pick from your library: "
+    ).strip()
+    if raw:
+        if not is_apple_url(raw):
+            print("That doesn't look like an Apple Music URL — treating it as a library name.")
+            return {"type": "library", "ref": raw}
+        return {"type": "url", "ref": raw}
+
+    try:
+        names = list_apple_playlists()
+    except AppleMusicAuthError:
+        print(_automation_help())
+        return None
+    if not names:
+        print("No user playlists found in Apple Music.")
+        return None
+    name = pick_playlist_interactive(names)
+    if not name:
+        return None
+    return {"type": "library", "ref": name}
+
+
+def _automation_help() -> str:
+    return (
+        "Apple Music automation is not authorized.\n"
+        "Enable it via: System Settings -> Privacy & Security -> Automation -> "
+        "[Terminal] -> enable 'Music'. Then re-run this tool."
+    )
+
+
 def confirm(prompt: str) -> bool:
     answer = input(prompt).strip().lower()
     return answer in ("y", "yes")
@@ -509,16 +881,24 @@ def confirm(prompt: str) -> bool:
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="apple_to_ytmusic.py",
-        description="Mirror an Apple Music playlist to YouTube Music, then download it for an iPod.",
+        description="Mirror an Apple Music playlist (URL or library) to YouTube Music, then optionally download it.",
     )
+    parser.add_argument("--url", type=str, default=None,
+                        help="Public/shared Apple Music playlist URL to mirror (no library membership needed).")
     parser.add_argument("--playlist", type=str, default=None,
-                        help="Apple Music playlist name to run (skips interactive picker).")
+                        help="Apple Music LIBRARY playlist name to run (skips interactive picker).")
     parser.add_argument("--no-download", action="store_true",
-                        help="Run Stage 1+2 only (search, create, add); skip Stage 3 download.")
+                        help="Run Stage 1+2 only (search, create, add); skip the download.")
     parser.add_argument("--report-only", action="store_true",
                         help="Run Stage 1+2 search & scoring, write match_report.csv, but do not create/modify a YT playlist and do not download.")
     parser.add_argument("--stage1-only", action="store_true",
-                        help="Run Stage 1 only: extract the playlist's tracks from Apple Music and print them. Requires no ytmusicapi credentials.")
+                        help="Run Stage 1 only: read the playlist's tracks and print them. No ytmusicapi credentials needed.")
+    parser.add_argument("--sync", action="store_true",
+                        help="Re-check every tracked playlist and ADD new songs only (never deletes). Non-interactive; no download.")
+    parser.add_argument("--install-weekly", action="store_true",
+                        help="Install a launchd job that runs --sync every Sunday at 03:00.")
+    parser.add_argument("--uninstall-weekly", action="store_true",
+                        help="Remove the weekly --sync launchd job.")
     parser.add_argument("--out", type=str, default=DEFAULT_OUT,
                         help=f"Download target dir / report dir (default: {DEFAULT_OUT}).")
     parser.add_argument("--creds", type=str, default=DEFAULT_CREDS,
@@ -530,50 +910,61 @@ def parse_args(argv=None) -> argparse.Namespace:
 # main
 # ---------------------------------------------------------------------------
 
+def resolve_source(args) -> dict:
+    """Determine the playlist source from flags or interactively."""
+    if args.url:
+        return {"type": "url", "ref": args.url}
+    if args.playlist:
+        return {"type": "library", "ref": args.playlist}
+    return choose_source_interactive()
+
+
+def prompt_download_choice() -> bool:
+    """Interactive: download offline now, or just keep the YT Music playlist."""
+    print("\nWhat next?")
+    print("  1. Download the playlist offline now (for your iPod)")
+    print("  2. Just keep the YouTube Music playlist (done)")
+    while True:
+        choice = input("Choose [1/2]: ").strip()
+        if choice == "1":
+            return True
+        if choice in ("2", "", "q"):
+            return False
+        print("Please enter 1 or 2.")
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    try:
-        names = list_apple_playlists()
-    except AppleMusicAuthError:
-        print(
-            "Apple Music automation is not authorized.\n"
-            "Enable it via: System Settings -> Privacy & Security -> Automation -> "
-            "[Terminal] -> enable 'Music'. Then re-run this tool."
-        )
-        return 2
-    except AppleScriptError as e:
-        print(f"AppleScript error while listing playlists: {e}")
-        return 2
+    # --- scheduling commands ---
+    if args.install_weekly:
+        return install_weekly(args.creds)
+    if args.uninstall_weekly:
+        return uninstall_weekly()
+    if args.sync:
+        return run_sync(args.creds)
 
-    if not names:
-        print("No user playlists found in Apple Music.")
+    # --- determine the source (URL / library / interactive) ---
+    source = resolve_source(args)
+    if not source:
+        print("No playlist selected. Exiting.")
         return 0
 
-    if args.playlist:
-        if args.playlist not in names:
-            print(f"Playlist '{args.playlist}' not found. Available playlists:")
-            for n in names:
-                print(f"  - {n}")
-            return 2
-        name = args.playlist
-    else:
-        name = pick_playlist_interactive(names)
-        if not name:
-            print("No playlist selected. Exiting.")
-            return 0
-
+    # --- Stage 1: read tracks ---
     try:
-        tracks = dump_apple_tracks(name)
+        name, tracks = get_tracks_from_source(source)
     except AppleMusicAuthError:
-        print(
-            "Apple Music automation is not authorized.\n"
-            "Enable it via: System Settings -> Privacy & Security -> Automation -> "
-            "[Terminal] -> enable 'Music'. Then re-run this tool."
-        )
+        print(_automation_help())
         return 2
     except AppleScriptError as e:
-        print(f"AppleScript error while reading tracks: {e}")
+        if source["type"] == "library":
+            print(f"Playlist '{source['ref']}' could not be read: {e}\n"
+                  "If the name is wrong, run without --playlist to pick from a list.")
+        else:
+            print(f"AppleScript error: {e}")
+        return 2
+    except AppleURLError as e:
+        print(str(e))
         return 2
 
     if not tracks:
@@ -581,12 +972,15 @@ def main(argv=None) -> int:
         return 0
 
     if args.stage1_only:
-        print(f"\nPlaylist '{name}' — {len(tracks)} tracks:")
+        origin = "URL" if source["type"] == "url" else "library"
+        print(f"\nPlaylist '{name}' ({origin}) — {len(tracks)} tracks:")
         for i, t in enumerate(tracks, start=1):
             mins, secs = divmod(int(round(t["duration"])), 60)
-            print(f'  {i:>3}. {t["title"]} — {t["artist"]}  [{t["album"]}]  ({mins}:{secs:02d})')
+            album = f'  [{t["album"]}]' if t["album"] else ""
+            print(f'  {i:>3}. {t["title"]} — {t["artist"]}{album}  ({mins}:{secs:02d})')
         return 0
 
+    # --- Stage 2: match ---
     try:
         yt = make_ytmusic(resolve_creds(args.creds))
     except CredsError as e:
@@ -596,8 +990,6 @@ def main(argv=None) -> int:
     matches = match_playlist(yt, tracks)
 
     report_dir = args.out if args.out else SCRIPT_DIR
-    if args.report_only and not args.out:
-        report_dir = SCRIPT_DIR
     os.makedirs(report_dir, exist_ok=True)
     report_path = os.path.join(report_dir, REPORT_FILE)
     write_report(report_path, matches)
@@ -612,9 +1004,10 @@ def main(argv=None) -> int:
         print("Report only. No playlist created.")
         return 0
 
+    # --- Stage 2: create + add (idempotent) ---
     runs = load_runs()
     try:
-        pid, already = get_or_create_playlist(yt, name, runs)
+        pid, already = get_or_create_playlist(yt, name, runs, source)
     except CredsError as e:
         print(str(e))
         return 2
@@ -627,8 +1020,10 @@ def main(argv=None) -> int:
     if args.no_download:
         return 0
 
-    if not confirm(f"Download {matched} tracks to {args.out}? [y/N] "):
-        print("Skipped download.")
+    # --- Stage 3: download or just keep ---
+    want_download = prompt_download_choice()
+    if not want_download:
+        print("Done — playlist is on YouTube Music. (Re-run any time; it only adds new songs.)")
         return 0
 
     rc = download_playlist(pid, name, args.out)
