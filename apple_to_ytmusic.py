@@ -8,8 +8,8 @@ Sources (a playlist can come from either):
     read straight from the public web page. The playlist does NOT need to be in
     your library.
   * A playlist in your own Apple Music library, read via AppleScript.
-  * An Apple Music ARTIST share link — mirrors that artist's ~24 Top Songs as
-    "<Artist> — Top Songs".
+  * An Apple Music ARTIST share link — mirrors that artist's full Top Songs list
+    (via Apple's public API) as "<Artist> — Top Songs".
 
 Stages:
   1. Read a playlist + its tracks (URL scrape or AppleScript).
@@ -191,16 +191,22 @@ def is_apple_artist_url(s: str) -> bool:
     return bool(s) and bool(APPLE_ARTIST_URL_RE.match(s.strip()))
 
 
-def fetch_url(url: str, timeout: int = 30) -> str:
-    """Fetch a URL with a browser User-Agent; return decoded HTML text.
+def fetch_url(url: str, timeout: int = 30, headers: dict = None) -> str:
+    """Fetch a URL with a browser User-Agent; return decoded text.
 
     Prefers `curl` (uses the macOS system trust store, avoiding the
     Python.framework's missing-CA-roots SSL problem); falls back to urllib.
+    `headers` adds request headers (e.g. an Authorization bearer for the API).
     """
+    base_headers = {"Accept-Language": "en-US,en;q=0.9"}
+    base_headers.update(headers or {})
     try:
+        curl_headers = []
+        for k, v in base_headers.items():
+            curl_headers += ["-H", f"{k}: {v}"]
         proc = subprocess.run(
             ["curl", "-sL", "--max-time", str(timeout), "-A", USER_AGENT,
-             "-H", "Accept-Language: en-US,en;q=0.9", url],
+             *curl_headers, url],
             capture_output=True, timeout=timeout + 10,
         )
         if proc.returncode == 0 and proc.stdout:
@@ -208,8 +214,9 @@ def fetch_url(url: str, timeout: int = 30) -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass  # curl unavailable or timed out — try urllib below
 
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
-                                               "Accept-Language": "en-US,en;q=0.9"})
+    req_headers = {"User-Agent": USER_AGENT}
+    req_headers.update(base_headers)
+    req = urllib.request.Request(url, headers=req_headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
@@ -408,11 +415,96 @@ def parse_apple_artist_html(html: str):
     return name, tracks
 
 
+def _apple_storefront_and_id(url: str):
+    """Extract (storefront, artist_id) from an artist URL. Storefront defaults to 'us'."""
+    m = re.search(r"music\.apple\.com/(?:([a-z]{2,3})/)?artist/[^/]+/(\d+)", url, re.I)
+    if not m:
+        return None, None
+    return (m.group(1) or "us").lower(), m.group(2)
+
+
+def _apple_media_token(html: str):
+    """Pull Apple Music's anonymous MusicKit bearer token from the page's JS bundle.
+
+    The artist page HTML references a main JS bundle (/assets/index~<hash>.js) that
+    embeds a short-lived, login-free developer token. It rotates periodically, so it
+    must be read fresh each run rather than hard-coded. Returns None on any failure.
+    """
+    m = re.search(r"/assets/index~[A-Za-z0-9]+\.js", html)
+    if not m:
+        return None
+    try:
+        bundle = fetch_url("https://music.apple.com" + m.group(0))
+    except AppleURLError:
+        return None
+    tm = re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", bundle)
+    return tm.group(0) if tm else None
+
+
+def _fetch_artist_top_songs_api(url: str, html: str) -> list:
+    """Return the artist's FULL Top Songs via Apple's amp-api, or [] on any failure.
+
+    The artist page HTML only embeds the first ~24 Top Songs; the complete list
+    (often 50-100 tracks) is served by amp-api.music.apple.com behind the page's
+    anonymous bearer token — the same list you see under the page's "See All".
+    Track dicts match the standard {title, artist, album, duration(seconds)} shape.
+    Never raises: any problem returns [] so the caller can fall back to the HTML shelf.
+    """
+    storefront, artist_id = _apple_storefront_and_id(url)
+    if not storefront or not artist_id:
+        return []
+    token = _apple_media_token(html)
+    if not token:
+        return []
+    headers = {"Authorization": f"Bearer {token}", "Origin": "https://music.apple.com"}
+    tracks = []
+    seen = set()
+    path = (f"/v1/catalog/{storefront}/artists/{artist_id}"
+            f"/view/top-songs?l=en-GB&limit=100")
+    while path:
+        try:
+            data = json.loads(fetch_url("https://amp-api.music.apple.com" + path,
+                                        headers=headers))
+        except (AppleURLError, json.JSONDecodeError):
+            break
+        if not isinstance(data, dict) or data.get("errors"):
+            break
+        items = data.get("data") or []
+        if not items:
+            break
+        for s in items:
+            attrs = s.get("attributes") or {}
+            title = attrs.get("name") or ""
+            if not title:
+                continue
+            key = s.get("id") or (title, attrs.get("artistName"))
+            if key in seen:
+                continue
+            seen.add(key)
+            dur_ms = attrs.get("durationInMillis")
+            try:
+                duration = float(dur_ms) / 1000.0 if dur_ms else 0.0
+            except (ValueError, TypeError):
+                duration = 0.0
+            tracks.append({
+                "title": title,
+                "artist": attrs.get("artistName") or "",
+                "album": attrs.get("albumName") or "",
+                "duration": duration,
+            })
+        nxt = data.get("next")
+        # `next` is a relative /v1/... path; stop when absent or non-advancing.
+        path = nxt if (nxt and nxt.startswith("/") and nxt != path) else None
+    return tracks
+
+
 def fetch_apple_artist_url(url: str):
     """Read a public Apple Music ARTIST page. Returns (name, tracks).
 
-    `name` is f"{artist} — Top Songs" — that string becomes the mirrored
-    playlist's title and the runs.json tracking key.
+    Pulls the artist's FULL Top Songs from Apple's amp-api (auth-free anonymous
+    token scraped from the page). Falls back to the ~24 Top Songs embedded in the
+    page HTML if the API is unreachable. `name` is f"{artist} — Top Songs" — that
+    string becomes the mirrored playlist's title and the runs.json tracking key.
     """
     if not is_apple_artist_url(url):
         raise AppleURLError(
@@ -420,12 +512,24 @@ def fetch_apple_artist_url(url: str):
             "music.apple.com/<cc>/artist/<slug>/<id>."
         )
     html = fetch_url(url)
-    artist, tracks = parse_apple_artist_html(html)
+    artist, html_tracks = parse_apple_artist_html(html)
     artist = artist or _artist_name_from_url(url)
+
+    tracks = _fetch_artist_top_songs_api(url, html)
+    if not tracks:
+        # API unavailable (token/layout change) — fall back to the HTML shelf.
+        tracks = html_tracks
+        if tracks:
+            print(
+                f"  ! Note: fetched {len(tracks)} Top Songs from the page (the full "
+                "list API was unavailable). This is the subset Apple embeds directly.",
+                file=sys.stderr,
+            )
+
     if not tracks:
         raise AppleURLError(
-            f"No top songs found on the artist page for {url}. Apple may not "
-            "surface Top Songs for this artist/region, or the page layout changed."
+            f"No top songs found for {url}. Apple may not surface Top Songs for "
+            "this artist/region, or the page layout changed."
         )
     return f"{artist} — Top Songs", tracks
 
@@ -742,14 +846,20 @@ def write_report(path: str, matches: list) -> None:
 # Stage 3 — download
 # ---------------------------------------------------------------------------
 
-def download_playlist(pid: str, name: str, out_dir: str) -> int:
+def download_playlist(pid: str, name: str, out_dir: str,
+                      album_artist: str = None) -> int:
     os.makedirs(out_dir, exist_ok=True)
-    proc = subprocess.run([
+    cmd = [
         PY313, STREAMLIST,
         "--url", YTM_URL.format(pid=pid),
         "--name", name,
         "--out", out_dir,
-    ], check=False)
+    ]
+    if album_artist:
+        # Tag the offline album to the artist (from the link), not streamlist's
+        # default "Aey - <album>" prefix.
+        cmd += ["--album-artist", album_artist]
+    proc = subprocess.run(cmd, check=False)
     return proc.returncode
 
 
@@ -1131,7 +1241,12 @@ def main(argv=None) -> int:
         print("Done — playlist is on YouTube Music. (Re-run any time; it only adds new songs.)")
         return 0
 
-    rc = download_playlist(pid, name, args.out)
+    # For an artist link, tag the offline album to the artist (from the link's
+    # slug) instead of streamlist's default "Aey - <album>".
+    album_artist = None
+    if source["type"] == "url" and is_apple_artist_url(source["ref"]):
+        album_artist = _artist_name_from_url(source["ref"])
+    rc = download_playlist(pid, name, args.out, album_artist=album_artist)
     return rc
 
 

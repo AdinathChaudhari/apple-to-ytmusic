@@ -11,11 +11,14 @@ add only *new* songs and never delete anything.
    the public page. This is the simplest path: paste a link, get a YouTube Music playlist.
 2. **An Apple Music ARTIST URL** (`music.apple.com/.../artist/<slug>/<id>`, e.g.
    `https://music.apple.com/in/artist/vidhya-gopal/1121565525`). The tool mirrors that
-   artist's Top Songs as a playlist named `"<Artist> — Top Songs"`. `--sync` re-pulls Top
-   Songs weekly, **additively** — songs that drop out of Apple's Top Songs are not removed,
-   the mirror only accretes, by design. The `runs.json` key is the artist **name**, so the
-   same artist reached via different storefront URLs (`/us/`, `/in/`, …) converges to one
-   entry.
+   artist's **full Top Songs list** as a playlist named `"<Artist> — Top Songs"`. It fetches
+   the complete list (typically 50–100 songs) from Apple's public API — not just the ~24 the
+   page shows at a glance — and falls back to the page's embedded songs if the API is
+   unavailable. `--sync` re-pulls Top Songs weekly, **additively** — songs that drop out of
+   Apple's Top Songs are not removed, the mirror only accretes, by design. The `runs.json`
+   key is the artist **name**, so the same artist reached via different storefront URLs
+   (`/us/`, `/in/`, …) converges to one entry. Downloaded offline, the album-artist tag is
+   the artist name (not the default `"Aey - …"`).
 3. **A playlist in your own Apple Music library**, read via AppleScript (for private
    playlists you haven't shared).
 

@@ -60,23 +60,32 @@ that playlist to your library for full coverage (library mode has no cap).
 
 ### 2c. From an artist URL — mirroring Top Songs
 
-An artist page (`music.apple.com/.../artist/<slug>/<id>`) embeds the exact same
-`serialized-server-data` JSON as a playlist page — so this isn't a new scraper, it's a
-new *input variant* on Stage 1. `get_tracks_from_source` sniffs the URL's shape (does it
-match `/artist/.../\d+/`?) and routes artist links to a small artist-specific parser that
-reuses the same recursive song-object walker as the playlist path. Two details matter:
+An artist link (`music.apple.com/.../artist/<slug>/<id>`) is a new *input variant* on
+Stage 1, not a new scraper. `get_tracks_from_source` sniffs the URL's shape (does it match
+`/artist/.../\d+`?) and routes artist links to an artist-specific fetcher.
 
-- **No sorting.** The playlist parser sorts songs by `trackNumber`; the artist parser
-  does not — the page's own document order *is* the Top Songs ranking, and sorting it
-  would scramble that order.
-- **Per-song artist credit, not the headline artist.** Every song keeps its own
-  `artistName` (with a `subtitleLinks` fallback) instead of being flattened to the artist
-  whose page it came from — the scorer weights artist match 40/100, and a Top Songs entry
-  is often a feature credit, not the headline artist.
+**Getting the *full* Top Songs list.** The artist page HTML only embeds the first ~24 Top
+Songs (that's all its initial render needs). The complete list — the 50-100 songs you see
+under the page's "See All" — is served by Apple's `amp-api.music.apple.com`, behind a
+short-lived **anonymous** bearer token. So `fetch_apple_artist_url`:
 
-The mirrored playlist is named `"<Artist> — Top Songs"`, which also becomes its
-`runs.json` tracking key. `--sync` re-pulls it weekly like any other source — additively,
-never removing a song that drops out of the artist's current Top Songs.
+1. loads the artist page and reads the headline artist name from its JSON-LD `MusicGroup`;
+2. scrapes that token out of the page's main JS bundle (`/assets/index~<hash>.js`) — it's
+   login-free and rotates, so it's read fresh each run, never hard-coded;
+3. calls `/v1/catalog/<storefront>/artists/<id>/view/top-songs?limit=100` (paginating on
+   the response's `next`) and maps each result to the standard track dict.
+
+If any of that fails (Apple changes the bundle, token, or endpoint), it **falls back** to
+the ~24 songs embedded in the page HTML and prints a note — degraded, never broken. Two
+details carry over from the page data: songs stay in **Top Songs order** (no `trackNumber`
+sort), and each keeps its **own per-song artist** (a Top Songs entry is often a feature
+credit, not the headline artist, and the matcher weights artist 40/100).
+
+The mirrored playlist is named `"<Artist> — Top Songs"`, which is also its `runs.json`
+tracking key. `--sync` re-pulls it weekly like any other source — additively, never
+removing a song that drops out of the artist's current Top Songs. When downloaded offline,
+the album-artist tag is set to the artist (from the link's slug), not streamlist's default
+`"Aey - …"` prefix.
 
 ---
 
@@ -182,10 +191,11 @@ Everything is one file, `apple_to_ytmusic.py`, grouped by stage:
 - **Stage 1b — URL**: `is_apple_url`, `fetch_url` (curl-first), `parse_apple_playlist_html`,
   `fetch_apple_url`. Shared song-object extraction lives in `_iter_server_data_songs` /
   `_song_obj_to_track`, reused by both the playlist and artist parsers.
-- **Stage 1b (artist variant)**: `is_apple_artist_url`, `parse_apple_artist_html`,
-  `fetch_apple_artist_url` — same `serialized-server-data` walker as playlists, but no
-  `trackNumber` sort (document order is Top Songs order). Dispatch on URL shape happens
-  in one place, `get_tracks_from_source`.
+- **Stage 1b (artist variant)**: `is_apple_artist_url`, `fetch_apple_artist_url`, backed by
+  `_fetch_artist_top_songs_api` (full list via amp-api) with `_apple_storefront_and_id` +
+  `_apple_media_token` (anonymous token from the JS bundle), and `parse_apple_artist_html`
+  as the HTML fallback (reuses the `_iter_server_data_songs` walker, no `trackNumber` sort).
+  Dispatch on URL shape happens in one place, `get_tracks_from_source`.
 - **Stage 2 — scoring**: `normalize`, `token_set_ratio`, `has_variant_keyword`,
   `duration_score`, `score_candidate`, `choose_match`, `search_track`, `match_playlist`.
 - **Stage 2 — persistence**: `load_runs` / `save_runs`, `get_or_create_playlist`,
