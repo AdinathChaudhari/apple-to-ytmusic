@@ -1122,6 +1122,33 @@ def parse_args(argv=None) -> argparse.Namespace:
 # main
 # ---------------------------------------------------------------------------
 
+def ensure_correct_interpreter() -> None:
+    """Re-exec under the framework Python 3.13 if launched with another interpreter.
+
+    The script's dependencies (ytmusicapi) live in the Python.framework 3.13 site-
+    packages that the shebang points to. Running it explicitly with a different
+    interpreter (e.g. `some-venv/bin/python apple_to_ytmusic.py`) would miss them.
+    This transparently relaunches the exact same command under PY313 so it "just
+    works" regardless of how it was invoked. Guarded against re-exec loops and
+    no-ops when PY313 is already the running (or an unavailable) interpreter.
+    """
+    if os.environ.get("_A2Y_REEXECED"):
+        return
+    try:
+        same = os.path.realpath(sys.executable) == os.path.realpath(PY313)
+    except OSError:
+        same = False
+    if same or not os.path.exists(PY313):
+        return
+    os.environ["_A2Y_REEXECED"] = "1"
+    try:
+        os.execv(PY313, [PY313, os.path.abspath(__file__), *sys.argv[1:]])
+    except OSError:
+        # Could not re-exec — fall through and let the normal ytmusicapi
+        # ImportError guidance (which names PY313) handle it.
+        pass
+
+
 def resolve_source(args) -> dict:
     """Determine the playlist source from flags or interactively."""
     if args.url:
@@ -1251,4 +1278,5 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    ensure_correct_interpreter()
     sys.exit(main())
