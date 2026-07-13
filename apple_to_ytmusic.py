@@ -8,6 +8,8 @@ Sources (a playlist can come from either):
     read straight from the public web page. The playlist does NOT need to be in
     your library.
   * A playlist in your own Apple Music library, read via AppleScript.
+  * An Apple Music ARTIST share link — mirrors that artist's ~24 Top Songs as
+    "<Artist> — Top Songs".
 
 Stages:
   1. Read a playlist + its tracks (URL scrape or AppleScript).
@@ -74,6 +76,10 @@ VARIANT_KEYWORDS = [
 ]
 
 APPLE_URL_RE = re.compile(r"https?://(?:[a-z0-9-]+\.)*music\.apple\.com/\S+", re.I)
+APPLE_ARTIST_URL_RE = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)*music\.apple\.com/(?:[a-z]{2,3}/)?artist/[^/]+/\d+",
+    re.I,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +186,11 @@ def is_apple_url(s: str) -> bool:
     return bool(s) and bool(APPLE_URL_RE.match(s.strip()))
 
 
+def is_apple_artist_url(s: str) -> bool:
+    """True if the string looks like an Apple Music ARTIST page URL."""
+    return bool(s) and bool(APPLE_ARTIST_URL_RE.match(s.strip()))
+
+
 def fetch_url(url: str, timeout: int = 30) -> str:
     """Fetch a URL with a browser User-Agent; return decoded HTML text.
 
@@ -207,6 +218,66 @@ def fetch_url(url: str, timeout: int = 30) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _iter_server_data_songs(html: str) -> list:
+    """Extract raw song objects from a page's serialized-server-data block.
+
+    Returns them in DOCUMENT order (caller decides whether to sort). Returns
+    [] if the block is missing, unparseable, or contains no songs.
+    """
+    m2 = re.search(r'<script[^>]*id="serialized-server-data"[^>]*>(.*?)</script>',
+                   html, re.S)
+    if not m2:
+        return []
+    try:
+        data = json.loads(m2.group(1))
+    except json.JSONDecodeError:
+        return []
+    if data is None:
+        return []
+
+    songs = []
+    seen_ids = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            cd = o.get("contentDescriptor")
+            is_song = isinstance(cd, dict) and cd.get("kind") == "song"
+            if is_song and o.get("title"):
+                key = o.get("id") or (o.get("title"), o.get("artistName"),
+                                      o.get("trackNumber"))
+                if key not in seen_ids:
+                    seen_ids.add(key)
+                    songs.append(o)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(data)
+    return songs
+
+
+def _song_obj_to_track(o: dict) -> dict:
+    """Convert one raw serialized-server-data song object to our track dict."""
+    artist = o.get("artistName") or ""
+    if not artist:
+        sl = o.get("subtitleLinks")
+        if isinstance(sl, list) and sl:
+            artist = sl[0].get("title", "")
+    dur_ms = o.get("duration")
+    try:
+        duration = float(dur_ms) / 1000.0 if dur_ms else 0.0
+    except (ValueError, TypeError):
+        duration = 0.0
+    return {
+        "title": o.get("title", ""),
+        "artist": artist,
+        "album": "",
+        "duration": duration,
+    }
+
+
 def parse_apple_playlist_html(html: str):
     """Parse an Apple Music playlist page.
 
@@ -229,60 +300,16 @@ def parse_apple_playlist_html(html: str):
             pass
 
     # (b) serialized-server-data holds the full per-track detail (title/artist/duration).
-    tracks = []
-    m2 = re.search(r'<script[^>]*id="serialized-server-data"[^>]*>(.*?)</script>',
-                   html, re.S)
-    if m2:
+    songs = _iter_server_data_songs(html)
+
+    def track_number(o):
         try:
-            data = json.loads(m2.group(1))
-        except json.JSONDecodeError:
-            data = None
-        if data is not None:
-            songs = []
-            seen_ids = set()
+            return int(o.get("trackNumber") or 0)
+        except (ValueError, TypeError):
+            return 0
 
-            def walk(o):
-                if isinstance(o, dict):
-                    cd = o.get("contentDescriptor")
-                    is_song = isinstance(cd, dict) and cd.get("kind") == "song"
-                    if is_song and o.get("title"):
-                        key = o.get("id") or (o.get("title"), o.get("artistName"),
-                                              o.get("trackNumber"))
-                        if key not in seen_ids:
-                            seen_ids.add(key)
-                            songs.append(o)
-                    for v in o.values():
-                        walk(v)
-                elif isinstance(o, list):
-                    for v in o:
-                        walk(v)
-
-            walk(data)
-
-            def track_number(o):
-                try:
-                    return int(o.get("trackNumber") or 0)
-                except (ValueError, TypeError):
-                    return 0
-
-            songs.sort(key=track_number)
-            for o in songs:
-                artist = o.get("artistName") or ""
-                if not artist:
-                    sl = o.get("subtitleLinks")
-                    if isinstance(sl, list) and sl:
-                        artist = sl[0].get("title", "")
-                dur_ms = o.get("duration")
-                try:
-                    duration = float(dur_ms) / 1000.0 if dur_ms else 0.0
-                except (ValueError, TypeError):
-                    duration = 0.0
-                tracks.append({
-                    "title": o.get("title", ""),
-                    "artist": artist,
-                    "album": "",
-                    "duration": duration,
-                })
+    songs.sort(key=track_number)
+    tracks = [_song_obj_to_track(o) for o in songs]
 
     if not name:
         # last resort: slug from the URL path is handled by the caller
@@ -297,6 +324,15 @@ def _name_from_apple_url(url: str) -> str:
         slug = m.group(1).replace("-", " ").strip()
         return slug.title() if slug else "Apple Music Playlist"
     return "Apple Music Playlist"
+
+
+def _artist_name_from_url(url: str) -> str:
+    """Derive a human-ish artist name from the URL slug as a last resort."""
+    m = re.search(r"/artist/([^/]+)/", url)
+    if m:
+        slug = m.group(1).replace("-", " ").strip()
+        return slug.title() if slug else "Apple Music Artist"
+    return "Apple Music Artist"
 
 
 def fetch_apple_url(url: str):
@@ -331,6 +367,69 @@ def fetch_apple_url(url: str):
     return name, tracks
 
 
+def parse_apple_artist_html(html: str):
+    """Parse an Apple Music artist page's Top Songs.
+
+    Returns (artist_name_or_None, tracks). Tracks are dicts of
+    {title, artist, album, duration(seconds)} in the page's OWN order —
+    unlike the playlist parser, this is NOT sorted by trackNumber, because
+    document order IS Top Songs order (sorting would scramble it).
+    """
+    name = None
+
+    # (a) JSON-LD MusicGroup gives a reliable artist name.
+    m = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                  html, re.S)
+    if m:
+        try:
+            ld = json.loads(m.group(1))
+        except (json.JSONDecodeError, TypeError):
+            ld = None
+        if isinstance(ld, dict) and ld.get("@type") == "MusicGroup":
+            name = ld.get("name") or name
+        elif isinstance(ld, list):
+            for item in ld:
+                if isinstance(item, dict) and item.get("@type") == "MusicGroup":
+                    name = item.get("name") or name
+                    break
+
+    # (b) fall back to the <title> tag, stripping Apple's " on Apple Music" suffix.
+    if not name:
+        mt = re.search(r"<title[^>]*>(.*?)</title>", html, re.S)
+        if mt:
+            title = re.sub(r"\s*(?:on|-|\||–|—)\s*Apple\s*Music.*$", "",
+                            mt.group(1), flags=re.I | re.S).strip()
+            name = title or None
+
+    # (c) serialized-server-data holds Top Songs, in Top Songs order.
+    songs = _iter_server_data_songs(html)
+    tracks = [_song_obj_to_track(o) for o in songs]
+
+    return name, tracks
+
+
+def fetch_apple_artist_url(url: str):
+    """Read a public Apple Music ARTIST page. Returns (name, tracks).
+
+    `name` is f"{artist} — Top Songs" — that string becomes the mirrored
+    playlist's title and the runs.json tracking key.
+    """
+    if not is_apple_artist_url(url):
+        raise AppleURLError(
+            f"Not an Apple Music artist URL: {url!r}. Expected a link like "
+            "music.apple.com/<cc>/artist/<slug>/<id>."
+        )
+    html = fetch_url(url)
+    artist, tracks = parse_apple_artist_html(html)
+    artist = artist or _artist_name_from_url(url)
+    if not tracks:
+        raise AppleURLError(
+            f"No top songs found on the artist page for {url}. Apple may not "
+            "surface Top Songs for this artist/region, or the page layout changed."
+        )
+    return f"{artist} — Top Songs", tracks
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 — source dispatch
 # ---------------------------------------------------------------------------
@@ -338,10 +437,12 @@ def fetch_apple_url(url: str):
 def get_tracks_from_source(source: dict):
     """Given a source descriptor, return (name, tracks).
 
-    source = {"type": "url", "ref": <apple url>} or
+    source = {"type": "url", "ref": <apple playlist OR artist url>} or
              {"type": "library", "ref": <playlist name>}
     """
     if source["type"] == "url":
+        if is_apple_artist_url(source["ref"]):
+            return fetch_apple_artist_url(source["ref"])
         return fetch_apple_url(source["ref"])
     # library
     name = source["ref"]
@@ -843,7 +944,7 @@ def pick_playlist_interactive(names: list):
 def choose_source_interactive() -> dict:
     """Prompt for an Apple Music URL, or fall back to a library picker."""
     raw = input(
-        "Paste an Apple Music playlist URL, or press Enter to pick from your library: "
+        "Paste an Apple Music playlist or artist URL, or press Enter to pick from your library: "
     ).strip()
     if raw:
         if not is_apple_url(raw):
@@ -884,7 +985,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Mirror an Apple Music playlist (URL or library) to YouTube Music, then optionally download it.",
     )
     parser.add_argument("--url", type=str, default=None,
-                        help="Public/shared Apple Music playlist URL to mirror (no library membership needed).")
+                        help="Public Apple Music playlist OR artist URL. Artist links "
+                             "(music.apple.com/.../artist/...) mirror that artist's Top Songs.")
     parser.add_argument("--playlist", type=str, default=None,
                         help="Apple Music LIBRARY playlist name to run (skips interactive picker).")
     parser.add_argument("--no-download", action="store_true",
@@ -972,7 +1074,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.stage1_only:
-        origin = "URL" if source["type"] == "url" else "library"
+        if source["type"] == "url":
+            origin = "artist URL" if is_apple_artist_url(source["ref"]) else "URL"
+        else:
+            origin = "library"
         print(f"\nPlaylist '{name}' ({origin}) — {len(tracks)} tracks:")
         for i, t in enumerate(tracks, start=1):
             mins, secs = divmod(int(round(t["duration"])), 60)

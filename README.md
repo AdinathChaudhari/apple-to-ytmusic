@@ -4,12 +4,19 @@ Mirror an Apple Music playlist to YouTube Music — from a **shared URL** or fro
 **library** — then optionally download it for an iPod. Re-runs (and a weekly auto-sync)
 add only *new* songs and never delete anything.
 
-## Two ways to point it at a playlist
+## Ways to point it at a playlist
 
 1. **A public / shared Apple Music URL** (`music.apple.com/.../pl.xxxxx`). The playlist
    does **not** need to be in your library — the tool reads the track list straight from
    the public page. This is the simplest path: paste a link, get a YouTube Music playlist.
-2. **A playlist in your own Apple Music library**, read via AppleScript (for private
+2. **An Apple Music ARTIST URL** (`music.apple.com/.../artist/<slug>/<id>`, e.g.
+   `https://music.apple.com/in/artist/vidhya-gopal/1121565525`). The tool mirrors that
+   artist's Top Songs as a playlist named `"<Artist> — Top Songs"`. `--sync` re-pulls Top
+   Songs weekly, **additively** — songs that drop out of Apple's Top Songs are not removed,
+   the mirror only accretes, by design. The `runs.json` key is the artist **name**, so the
+   same artist reached via different storefront URLs (`/us/`, `/in/`, …) converges to one
+   entry.
+3. **A playlist in your own Apple Music library**, read via AppleScript (for private
    playlists you haven't shared).
 
 ## Requirements
@@ -75,8 +82,11 @@ Interactive (paste a URL, or pick from your library, then choose whether to down
 Direct:
 
 ```bash
-# From a shared Apple Music URL (not in your library):
+# From a shared Apple Music playlist URL (not in your library):
 ... apple_to_ytmusic.py --url "https://music.apple.com/us/playlist/…/pl.xxxxx"
+
+# From an Apple Music artist URL (mirrors their Top Songs):
+... apple_to_ytmusic.py --url "https://music.apple.com/in/artist/vidhya-gopal/1121565525"
 
 # From a library playlist by name:
 ... apple_to_ytmusic.py --playlist "French Songs"
@@ -84,7 +94,8 @@ Direct:
 
 ### Flags
 
-- `--url <apple music url>` — mirror a public/shared playlist (no library membership needed).
+- `--url <apple music url>` — mirror a public/shared playlist, OR an artist URL to mirror
+  that artist's Top Songs (no library membership needed either way).
 - `--playlist "<name>"` — mirror a library playlist by name (skips the picker).
 - `--no-download` — create/update the YT Music playlist and stop; no download.
 - `--report-only` — search & score only; write `match_report.csv`; create nothing.
