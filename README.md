@@ -1,67 +1,73 @@
-# apple-to-ytmusic
+<!--
+GitHub metadata — authored here, applied by hand in repo Settings (NOT rendered on the page):
+About:  Mirror Apple Music playlists (shared URL, artist Top Songs, or private library) to
+        YouTube Music & download them offline — a Python CLI on ytmusicapi and streamlist.
+Topics (ranked): apple-music, youtube-music, playlist-sync, ytmusicapi, streamlist, python,
+        macos, applescript, cli, offline-download, ipod, auto-sync, launchd, music-mirror,
+        playlist-migration
+Social preview: none planned (no hero image).
+-->
 
-Mirror an Apple Music playlist to YouTube Music — from a **shared URL** or from your
-**library** — then optionally download it for an iPod. Re-runs (and a weekly auto-sync)
-add only *new* songs and never delete anything.
+# apple-to-ytmusic — Apple Music → YouTube Music playlist mirror
 
-## Ways to point it at a playlist
+**Mirror any Apple Music playlist to YouTube Music, offline-ready.**  
+*A single Python script that scrapes Apple Music, matches tracks on YouTube Music via
+`ytmusicapi`, and hands off to `streamlist` for iPod-ready downloads.*
 
-1. **A public / shared Apple Music URL** (`music.apple.com/.../pl.xxxxx`). The playlist
-   does **not** need to be in your library — the tool reads the track list straight from
-   the public page. This is the simplest path: paste a link, get a YouTube Music playlist.
-2. **An Apple Music ARTIST URL** (`music.apple.com/.../artist/<slug>/<id>`, e.g.
-   `https://music.apple.com/in/artist/vidhya-gopal/1121565525`). The tool mirrors that
-   artist's **full Top Songs list** as a playlist named `"<Artist> — Top Songs"`. It fetches
-   the complete list (typically 50–100 songs) from Apple's public API — not just the ~24 the
-   page shows at a glance — and falls back to the page's embedded songs if the API is
-   unavailable. `--sync` re-pulls Top Songs weekly, **additively** — songs that drop out of
-   Apple's Top Songs are not removed, the mirror only accretes, by design. The `runs.json`
-   key is the artist **name**, so the same artist reached via different storefront URLs
-   (`/us/`, `/in/`, …) converges to one entry. Downloaded offline, the album-artist tag is
-   the artist name (not the default `"Aey - …"`).
-3. **A playlist in your own Apple Music library**, read via AppleScript (for private
-   playlists you haven't shared).
+![Python 3.13](https://img.shields.io/badge/python-3.13-blue)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
-## Requirements
+Re-runs — and a weekly auto-sync — add only *new* songs and never delete anything.
 
-- macOS with the Apple Music app installed and signed in (only needed for *library* mode).
-- The Python 3.13 framework interpreter:
-  `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`
-- `streamlist` checked out at `/Users/adinath/Documents/Playground/GitHub/streamlist/streamlist.py`
-  (only needed if you download).
+## The map
 
-**Everything in this tool runs under the 3.13 framework interpreter above** — not the system
-`python3` (which is 3.14 and does not have `yt_dlp` / `ytmusicapi`).
+| Input mode | What it does |
+|---|---|
+| **Shared URL** (`--url <playlist link>`) | Reads the track list straight off the public Apple Music page — no library membership needed |
+| **Artist URL** (`--url <artist link>`) | Mirrors that artist's full Top Songs list (50–100 tracks, via Apple's public API) as `"<Artist> — Top Songs"` |
+| **Library playlist** (`--playlist "<name>"`) | Reads a private playlist from your own Apple Music library via AppleScript |
 
-## Install
+## Quick start
 
 ```bash
 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m pip install -r requirements.txt
+/Library/Frameworks/Python.framework/Versions/3.13/bin/ytmusicapi browser --file browser.json
+/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 apple_to_ytmusic.py
 ```
 
-## One-time YouTube Music auth
+1. **Install** dependencies under the 3.13 framework interpreter — not the system `python3`
+   (that's 3.14 and lacks `yt_dlp` / `ytmusicapi`).
+2. **Authenticate** once with `ytmusicapi browser` (steps below).
+3. **Run** the script — paste a URL, or pick a library playlist, then choose whether to download.
 
-Browser-header auth (no Google Cloud project needed). Use the `ytmusicapi` **command**
-installed beside the 3.13 python — NOT `python -m ytmusicapi` (that has no `__main__` and errors):
+Matched tracks land in a YouTube Music playlist (and, if you chose to download, in
+`~/Music/apple-to-ytmusic`) — that's it, everything below is detail.
+
+---
+
+## YouTube Music auth (one-time)
+
+Browser-header auth, no Google Cloud project needed. Use the `ytmusicapi` **command** installed
+beside the 3.13 python — not `python -m ytmusicapi` (no `__main__`, it errors):
 
 ```bash
 /Library/Frameworks/Python.framework/Versions/3.13/bin/ytmusicapi browser --file browser.json
 ```
 
-1. Open `music.youtube.com` in a browser, logged in to the account the playlists should be
-   created under.
-2. DevTools (Cmd+Option+I) → Network tab → reload → left-click any `browse` request to
+1. **Open** `music.youtube.com`, logged in to the account playlists should be created under.
+2. **DevTools** (Cmd+Option+I) → Network tab → reload → left-click any `browse` request to
    `music.youtube.com`.
-3. In the detail panel → **Headers** tab → scroll to **Request Headers** → click the **`Raw`**
-   toggle. Select all that text (Cmd+A), copy, paste into the prompt, press Enter, then Ctrl-D.
-   (Use **Chrome/Firefox/Edge** — Safari's format doesn't parse. Use the **Raw** view, not the
-   expanded name/value view, which pulls in `:authority`/`:path` pseudo-headers and breaks parsing.)
+3. **Copy headers** — detail panel → Headers → Request Headers → click **Raw** → select all
+   (Cmd+A) → copy → paste into the prompt → Enter → Ctrl-D.
 
-Run it from inside this folder (or keep `--file browser.json`) so the file lands next to the
-script, where the tool looks for it. The tool auto-detects a missing/invalid creds file and
-points you back here. Credentials expire periodically — just re-run this step.
+Use **Chrome/Firefox/Edge** — Safari's header format doesn't parse. Use the **Raw** view, not the
+expanded name/value view (that pulls in `:authority`/`:path` pseudo-headers and breaks parsing).
 
-**Fallback (oauth):** requires a Google "TV & Limited Input" OAuth client:
+Run the auth command from inside this folder (or keep `--file browser.json`) so the file lands
+next to the script. The tool auto-detects a missing/invalid creds file and points you back here.
+Credentials expire periodically — just re-run this step.
+
+**Fallback (oauth)** — requires a Google "TV & Limited Input" OAuth client:
 
 ```bash
 /Library/Frameworks/Python.framework/Versions/3.13/bin/ytmusicapi oauth --file oauth.json
@@ -69,14 +75,11 @@ points you back here. Credentials expire periodically — just re-run this step.
 
 Then pass it with `--creds oauth.json`.
 
-## Automation permission (library mode only)
+---
 
-If you see "not authorized (-1743)": System Settings → Privacy & Security → Automation →
-[Terminal] → enable **Music**, then re-run.
+## Usage & flags
 
-## Usage
-
-Interactive (paste a URL, or pick from your library, then choose whether to download):
+Interactive:
 
 ```bash
 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 apple_to_ytmusic.py
@@ -85,31 +88,29 @@ Interactive (paste a URL, or pick from your library, then choose whether to down
 Direct:
 
 ```bash
-# From a shared Apple Music playlist URL (not in your library):
+# Shared Apple Music playlist URL (not in your library):
 ... apple_to_ytmusic.py --url "https://music.apple.com/us/playlist/…/pl.xxxxx"
 
-# From an Apple Music artist URL (mirrors their Top Songs):
+# Artist URL (mirrors their Top Songs):
 ... apple_to_ytmusic.py --url "https://music.apple.com/in/artist/vidhya-gopal/1121565525"
 
-# From a library playlist by name:
+# Library playlist by name:
 ... apple_to_ytmusic.py --playlist "French Songs"
 ```
 
-### Flags
+| Flag | Effect |
+|---|---|
+| `--url <apple music url>` | Mirror a public/shared playlist, or an artist URL to mirror Top Songs |
+| `--playlist "<name>"` | Mirror a library playlist by name (skips the picker) |
+| `--no-download` | Create/update the YT Music playlist and stop; no download |
+| `--report-only` | Search & score only; write `match_report.csv`; create nothing |
+| `--stage1-only` | Just read and print the tracks — no credentials needed, quickest sanity check |
+| `--sync` | Re-check every tracked playlist, add only new songs (what the weekly job runs) |
+| `--install-weekly` / `--uninstall-weekly` | Install/remove a launchd job that runs `--sync` every Sunday 03:00, logs to `sync.log` |
+| `--out <dir>` | Download / report directory (default `~/Music/apple-to-ytmusic`) |
+| `--creds <path>` | ytmusicapi creds file (default `browser.json` beside the script) |
 
-- `--url <apple music url>` — mirror a public/shared playlist, OR an artist URL to mirror
-  that artist's Top Songs (no library membership needed either way).
-- `--playlist "<name>"` — mirror a library playlist by name (skips the picker).
-- `--no-download` — create/update the YT Music playlist and stop; no download.
-- `--report-only` — search & score only; write `match_report.csv`; create nothing.
-- `--stage1-only` — just read and print the tracks. **No credentials needed** — quickest way
-  to sanity-check either a URL or a library name.
-- `--sync` — re-check **every** tracked playlist and add only new songs. Non-interactive, no
-  download. (This is what the weekly job runs.)
-- `--install-weekly` / `--uninstall-weekly` — install/remove a launchd job that runs `--sync`
-  every Sunday at 03:00. Logs to `sync.log`.
-- `--out <dir>` — download / report directory (default `~/Music/apple-to-ytmusic`).
-- `--creds <path>` — ytmusicapi creds file (default `browser.json` beside the script).
+---
 
 ## Weekly auto-sync
 
@@ -117,13 +118,13 @@ Direct:
 ... apple_to_ytmusic.py --install-weekly
 ```
 
-Every Sunday at 03:00 the tool re-reads each playlist you've mirrored (from its original URL or
-library name, remembered in `runs.json`) and adds any songs that appeared since last time. It
-**never removes** tracks. Check `sync.log` for what it did.
+Every Sunday at 03:00 the tool re-reads each mirrored playlist (from its original URL or library
+name, remembered in `runs.json`) and adds any songs that appeared since last time. It **never
+removes** tracks. Check `sync.log` for what it did.
 
 - **URL-sourced** playlists sync completely headlessly.
 - **Library-sourced** playlists need Apple Music running at sync time (AppleScript talks to the
-  app). If it isn't running, that playlist is skipped and logged; the next run catches up.
+  app). If it isn't running, that playlist is skipped and logged — the next run catches up.
 
 Test it immediately without waiting a week:
 
@@ -131,24 +132,44 @@ Test it immediately without waiting a week:
 launchctl kickstart -k gui/$(id -u)/com.adinath.apple-to-ytmusic.sync
 ```
 
+---
+
 ## How it works
 
 1. **Read** — a URL is scraped from the public Apple Music page (title/artist/duration from the
    embedded `serialized-server-data`); a library playlist is read via AppleScript (`osascript`),
    using a `\x1f`-delimited dump so titles with commas/accents survive intact.
 2. **Match + create** (`ytmusicapi`) — searches YT Music per track, scores candidates on
-   artist/title similarity + duration proximity (studio-preferred), picks the best match or
-   falls back to the raw top hit if nothing clears the confidence bar. Creates or reuses a
-   same-named YT Music playlist and adds matched tracks. Writes `match_report.csv` — check the
-   `confidence` column (`confident` / `fallback` / `none`).
-3. **Download** (optional; reuses `streamlist`) — downloads the YT Music playlist as AAC/M4A
-   with tags, ready for an iPod.
+   artist/title similarity + duration proximity (studio-preferred), picks the best match or falls
+   back to the raw top hit if nothing clears the confidence bar. Creates or reuses a same-named
+   YT Music playlist and adds matched tracks. Writes `match_report.csv` — check the `confidence`
+   column (`confident` / `fallback` / `none`).
+3. **Download** (optional; reuses `streamlist`) — downloads the YT Music playlist as AAC/M4A with
+   tags, ready for an iPod.
 
 `runs.json` remembers, per playlist, its YouTube Music id, its source (URL or library name), and
 which videoIds were already added — so re-runs and the weekly sync only add new songs and never
-create duplicates.
+create duplicates. The artist-mode key is the artist **name**, so the same artist reached via
+different storefront URLs (`/us/`, `/in/`, …) converges to one entry, and the downloaded
+album-artist tag is the artist name (not the default `"Aey - …"`).
 
-See **EXPLAINER.md** for a ground-up walkthrough.
+See **[EXPLAINER.md](EXPLAINER.md)** for a ground-up walkthrough.
+
+---
+
+## Requirements
+
+- macOS with the Apple Music app installed and signed in (only needed for *library* mode).
+- The Python 3.13 framework interpreter:
+  `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`
+- `streamlist` checked out at
+  `/Users/adinath/Documents/Playground/GitHub/streamlist/streamlist.py` (only needed if you
+  download).
+
+> **"not authorized (-1743)"** on library mode → System Settings → Privacy & Security →
+> Automation → Terminal → enable **Music**, then re-run.
+
+---
 
 ## Notes / caveats
 
