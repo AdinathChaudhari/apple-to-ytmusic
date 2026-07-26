@@ -8,3 +8,6 @@ runs.json
 sync.log
 downloads/
 .DS_Store
+
+# Private About-image prompt (personal speciality — not published)
+docs/media/ABOUT-IMAGE.md
