@@ -5,7 +5,7 @@ About:  Mirror Apple Music playlists (shared URL, artist Top Songs, or private l
 Topics (ranked): apple-music, youtube-music, playlist-sync, ytmusicapi, streamlist, python,
         macos, applescript, cli, offline-download, ipod, auto-sync, launchd, music-mirror,
         playlist-migration
-Social preview: none planned (no hero image).
+Social preview: docs/media/hero.png (1280×640).
 -->
 
 # apple-to-ytmusic — Apple Music → YouTube Music playlist mirror
@@ -16,6 +16,10 @@ Social preview: none planned (no hero image).
 
 ![Python 3.13](https://img.shields.io/badge/python-3.13-blue)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+
+<p align="center">
+  <img src="docs/media/hero.png" alt="apple-to-ytmusic" width="820">
+</p>
 
 Re-runs — and a weekly auto-sync — add only *new* songs and never delete anything.
 
