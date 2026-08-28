@@ -11,3 +11,8 @@ downloads/
 
 # Private About-image prompt (personal speciality — not published)
 docs/media/ABOUT-IMAGE.md
+
+# Derived social card, generated from hero.png and uploaded straight to
+# GitHub Settings > Social preview. Never committed — hero.png is the source
+# of truth. See GitHub/docs/image-processing.md.
+docs/media/hero-glass.jpg
