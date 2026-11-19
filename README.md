@@ -18,7 +18,7 @@ Social preview: docs/media/hero.png (1280×640).
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 <p align="center">
-  <img src="docs/media/hero.png" alt="apple-to-ytmusic" width="820">
+  <img src="docs/media/hero-rounded.png" alt="apple-to-ytmusic" width="820">
 </p>
 
 Re-runs — and a weekly auto-sync — add only *new* songs and never delete anything.
